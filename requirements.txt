@@ -1,0 +1,12 @@
+# Core dependencies
+# apache-airflow==2.8.1
+python-dotenv==1.0.0
+requests>=2.31.0
+pandas>=2.0.3
+prophet>=1.1.5
+snowflake-connector-python==3.6.0
+boto3==1.34.19
+
+# Streamlit
+streamlit
+plotly
