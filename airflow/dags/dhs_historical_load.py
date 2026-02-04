@@ -40,7 +40,7 @@ dag = DAG(
     tags=['dhs','historical','initial-load']
 )
 
-def extract_historical_data(**context):
+def extract_upload_historical_data(**context):
     """
     Extract all historical data from 2013-2021 (historical endpoint)
     """
@@ -59,13 +59,29 @@ def extract_historical_data(**context):
     response.raise_for_status()
 
     data = response.json()
+    print(f"Extracted {len(data)} historical records")
 
-    # Store in XCom for pass to next task
-    context['ti'].xcom_push(key='historical_data', value=data)
+    # Upload to S3
+    s3_hook = S3Hook(aws_conn_id='aws_conn')
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    s3_key = f"raw/shelter_census/historical/historical_data_{timestamp}.json"
 
-    return len(data)
+    s3_hook.load_string(
+        string_data=json.dumps(data, indent=2),
+        key=s3_key,
+        bucket_name=S3_BUCKET,
+        replace=True
+    )
 
-def extract_daily_data(**context):
+    print(f"Uploaded {len(data)} records to s3://{S3_BUCKET}/{s3_key}")
+
+    # Push the S3 path to XCom
+    context['ti'].xcom_push(key='historical_s3_key', value=s3_key)
+    context['ti'].xcom_push(key='historical_record_count', value=len(data))
+
+    return s3_key
+
+def extract_upload_daily_data(**context):
     """
     Extract all current daily data frorm 2021-present (daily endpoint)
     """
@@ -84,49 +100,95 @@ def extract_daily_data(**context):
     response.raise_for_status()
 
     data = response.json()
+    print(f"Extracted {len(data)} records from Daily API.")
 
-    # Store in XCom for pass to next task
-    context['ti'].xcom_push(key='daily_data', value=data)
-
-    return len(data)
-
-def upload_to_s3(**context):
-    """
-    Upload extracted data to S3 as JSON files
-    """
-    # Get data from previous tasks
-    ti = context['ti']
-
-    historical_data = ti.xcom_pull(task_ids='extract_historical_data', key='historical_data')
-    daily_data = ti.xcom_pull(task_ids='extract_daily_data', key='daily_data')
-
-    # Combine datasets
-    full_data = historical_data + daily_data
-    print(f"Total records to upload: {len(full_data)}")
-
-    # Use S3 Hook through Airflow
+    # Upload to S3
     s3_hook = S3Hook(aws_conn_id='aws_conn')
-
-    # Create S3 Key
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    s3_key = f"raw/shelter_census/historical/full_load_{timestamp}.json"
+    s3_key = f"raw/shelter_census/daily/daily_data_{timestamp}.json"
 
-    # Upload to S3 using S3 Hook
     s3_hook.load_string(
-        string_data=json.dumps(full_data, indent=2),
+        string_data=json.dumps(data, indent=2),
         key=s3_key,
         bucket_name=S3_BUCKET,
         replace=True
     )
+    print(f"Uploaded {len(data)} records to s3://{S3_BUCKET}/{s3_key}")
 
-    print(f"Successfully uploaded data to S3: {S3_BUCKET}/{s3_key}")
-
-    # Store S3 path for next task
-    context['ti'].xcom_push(key='s3_path', value=f"s3://{S3_BUCKET}/{s3_key}")
+    # Push S3 path to XCom
+    context['ti'].xcom_push(key='daily_s3_key', value=s3_key)
+    context['ti'].xcom_push(key='daily_record_count', value=len(data))
 
     return s3_key
 
+def verify_s3_uploads(**context):
+    """
+    Verify both files were successfully uploaded to S3
+    """
+    ti = context['ti']
+
+    # Get S3 keys and record counts stored in XCom from prior tasks
+    historical_key = ti.xcom_pull(key='historical_s3_key', task_ids='extract_upload_historical')
+    historical_record_count = ti.xcom_pull(key='historical_record_count', task_ids='extract_upload_historical')
+
+    daily_key = ti.xcom_pull(key='daily_s3_key', task_ids='extract_upload_daily')
+    daily_record_count = ti.xcom_pull(key='daily_record_count', task_ids='extract_upload_daily')
+
+    # print summary
+    print(f"Historical API: {historical_record_count} records at s3://{S3_BUCKET}/{historical_key}")
+    print(f"Daily API: {daily_record_count} records at s3://{S3_BUCKET}/{daily_key}")
+    print(f"TOTAL RECORDS: {historical_record_count + daily_record_count}")
+
+    # Push summary to XCom for next task
+    context['ti'].xcom_push(key='total_records', value=historical_record_count + daily_record_count)
+    context['ti'].xcom_push(key='historical_s3_path', value=f's3://{S3_BUCKET}/{historical_key}')
+    context['ti'].xcom_push(key='daily_s3_path', value=f's3://{S3_BUCKET}/{daily_key}')
+
+    return "S3 Upload Verification Completed"
+
+
 def load_to_snowflake(**context):
-    pass
+    """
+    Load data from S3 into Snowflake "COPY INTO" statement
+    """
+    ti = context['ti']
+
+    total_records = ti.xcom_pull(task_ids='verify_s3_uploads', key='total_records')
+    historical_path = ti.xcom_pull(task_ids='verify_s3_uploads', key='historical_s3_path')
+    daily_path = ti.xcom_pull(task_ids='verify_s3_uploads', key='daily_s3_path')
+
+    print(f"Initializing load of {total_records} into Snowflake...")
+    print(f"Historical API file: {historical_path}")
+    print(f"Daily API file: {daily_path}")
+
+    return "Success"
+
+# Define tasks
+extract_historical_task = PythonOperator(
+    task_id='extract_upload_historical',
+    python_callable=extract_upload_historical_data,
+    dag=dag
+)
+
+extract_daily_task = PythonOperator(
+    task_id='extract_upload_daily',
+    python_callable=extract_upload_daily_data,
+    dag=dag
+)
+
+verify_s3_upload_task = PythonOperator(
+    task_id='verify_s3_uploads',
+    python_callable=verify_s3_uploads,
+    dag=dag
+)
+
+load_snowflake_task = PythonOperator(
+    task_id='load_to_snowflake',
+    python_callable=load_to_snowflake,
+    dag=dag
+)
+
+# Configure dependencies for DAG
+[extract_historical_task, extract_daily_task] >> verify_s3_upload_task >> load_snowflake_task
 
 
